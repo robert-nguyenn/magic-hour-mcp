@@ -7,7 +7,11 @@ from mcp.shared.exceptions import MCPError as McpError
 
 
 def install_structured_tool_errors(mcp: FastMCP) -> None:
-    handler = mcp._mcp_server.request_handlers[mt.CallToolRequest]
+    try:
+        handler = mcp._mcp_server._request_handlers[mt.CallToolRequest]
+    except (AttributeError, KeyError):
+        # Attribute or handler not available in this MCP version
+        return
 
     async def handle(request: mt.CallToolRequest) -> mt.ServerResult:
         tool = await mcp.get_tool(request.params.name)
@@ -23,7 +27,11 @@ def install_structured_tool_errors(mcp: FastMCP) -> None:
 
         return await handler(request)
 
-    mcp._mcp_server.request_handlers[mt.CallToolRequest] = handle
+    try:
+        mcp._mcp_server._request_handlers[mt.CallToolRequest] = handle
+    except (AttributeError, KeyError):
+        # Attribute or handler not available in this MCP version
+        pass
 
 
 def _invalid_params(message: str) -> McpError:
