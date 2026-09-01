@@ -441,7 +441,7 @@ class MCPBearerChallengeMiddleware:
             await self.app(scope, receive, send)
             return
 
-        if scope.get("method") in {"OPTIONS", "POST"}:
+        if scope.get("method") == "OPTIONS":
             await self.app(scope, receive, send)
             return
 
