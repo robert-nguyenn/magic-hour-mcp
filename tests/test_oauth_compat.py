@@ -510,6 +510,29 @@ class OAuthCompatibilityTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(token.status_code, 200)
         self.assertEqual(token.json(), {"access_token": "sk_valid", "token_type": "Bearer"})
 
+    async def test_dynamic_registration_preserves_supported_refresh_grant(self):
+        registration = await self.client.post(
+            "/register",
+            json={
+                "client_name": "ChatGPT",
+                "redirect_uris": ["https://chatgpt.com/connector/oauth/test-callback"],
+                "grant_types": ["authorization_code", "refresh_token"],
+                "response_types": ["code"],
+                "token_endpoint_auth_method": "none",
+            },
+        )
+
+        self.assertEqual(registration.status_code, 201)
+        self.assertEqual(
+            registration.json()["grant_types"],
+            ["authorization_code", "refresh_token"],
+        )
+        metadata = await self.client.get("/.well-known/oauth-authorization-server")
+        self.assertEqual(
+            metadata.json()["grant_types_supported"],
+            ["authorization_code", "refresh_token"],
+        )
+
     async def test_dynamic_registration_rejects_insecure_or_query_callback(self):
         for redirect_uri in (
             "https://evil.example/callback?next=evil",

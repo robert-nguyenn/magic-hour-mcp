@@ -31,8 +31,10 @@ from .openapi_auth import AuthError, current_authorization_header
 
 
 CODE_TTL_SECONDS = 300
+REFRESH_TOKEN_TTL_SECONDS = 30 * 24 * 60 * 60
 MAX_FORM_BYTES = 16 * 1024
 MAX_PENDING_CODES = 1_000
+MAX_PENDING_REFRESH_TOKENS = 10_000
 MAX_CODES_PER_API_KEY = 3
 MAX_CONCURRENT_VALIDATIONS = 10
 API_KEY_VERIFICATION_ERROR = (
@@ -49,6 +51,7 @@ CHALLENGE_RE = re.compile(r"^[A-Za-z0-9_-]{43}$")
 ApiKeyValidator = Callable[[str], Awaitable[bool]]
 logger = logging.getLogger("uvicorn.error.mcp_oauth")
 OAUTH_SECURITY_SCHEMES = [{"type": "oauth2", "scopes": []}]
+SUPPORTED_GRANT_TYPES = ("authorization_code", "refresh_token")
 _DCR_SECRET_FIELDS = frozenset(
     {
         "client_secret",
@@ -93,6 +96,15 @@ class AuthorizationCode:
 class RegisteredClient:
     client_id: str
     redirect_uris: tuple[str, ...]
+    grant_types: tuple[str, ...] = ("authorization_code",)
+
+
+@dataclass(frozen=True)
+class RefreshToken:
+    client_id: str
+    api_key: str
+    resource: str | None
+    expires_at: float
 
 
 class AuthorizationCodeStore:
@@ -161,6 +173,44 @@ class AuthorizationCodeStore:
                 del self._codes[code]
 
 
+class RefreshTokenStore:
+    """Small process-local, rotating refresh-token store."""
+
+    def __init__(self, ttl_seconds: int = REFRESH_TOKEN_TTL_SECONDS) -> None:
+        self.ttl_seconds = ttl_seconds
+        self._tokens: dict[str, RefreshToken] = {}
+        self._lock = Lock()
+
+    def issue(self, *, client_id: str, api_key: str, resource: str | None) -> str:
+        token = secrets.token_urlsafe(48)
+        now = monotonic()
+        with self._lock:
+            self._remove_expired(now)
+            if len(self._tokens) >= MAX_PENDING_REFRESH_TOKENS:
+                raise OAuthCapacityError
+            self._tokens[token] = RefreshToken(
+                client_id=client_id,
+                api_key=api_key,
+                resource=resource,
+                expires_at=now + self.ttl_seconds,
+            )
+        return token
+
+    def consume(self, token: str) -> RefreshToken | None:
+        now = monotonic()
+        with self._lock:
+            refresh_token = self._tokens.pop(token, None)
+            self._remove_expired(now)
+        if refresh_token is None or refresh_token.expires_at <= now:
+            return None
+        return refresh_token
+
+    def _remove_expired(self, now: float) -> None:
+        for token, value in list(self._tokens.items()):
+            if value.expires_at <= now:
+                del self._tokens[token]
+
+
 @dataclass(frozen=True)
 class OAuthSettings:
     issuer_url: str | None = None
@@ -188,10 +238,12 @@ class OAuthCompatibilityServer:
         settings: OAuthSettings | None = None,
         api_key_validator: ApiKeyValidator | None = None,
         code_store: AuthorizationCodeStore | None = None,
+        refresh_token_store: RefreshTokenStore | None = None,
     ) -> None:
         self.settings = settings or OAuthSettings.from_env()
         _validate_settings(self.settings)
         self.codes = code_store or AuthorizationCodeStore()
+        self.refresh_tokens = refresh_token_store or RefreshTokenStore()
         self.validate_api_key = api_key_validator or self._validate_api_key
         self._validation_slots = asyncio.Semaphore(MAX_CONCURRENT_VALIDATIONS)
         self._registered_clients: dict[str, RegisteredClient] = {}
@@ -267,11 +319,14 @@ class OAuthCompatibilityServer:
         except OAuthRequestError as error:
             return _token_rejection("malformed_form", error.error, error.description)
 
-        if params.get("grant_type") != "authorization_code":
+        grant_type = params.get("grant_type")
+        if grant_type == "refresh_token":
+            return self._refresh_access_token(params)
+        if grant_type != "authorization_code":
             return _token_rejection(
                 "unsupported_grant_type",
                 "unsupported_grant_type",
-                "grant_type must be authorization_code",
+                "grant_type must be authorization_code or refresh_token",
             )
 
         code = params.get("code", "")
@@ -334,8 +389,53 @@ class OAuthCompatibilityServer:
                 "Authorization code is invalid or expired",
             )
 
+        response_body: dict[str, str] = {
+            "access_token": authorization.api_key,
+            "token_type": "Bearer",
+        }
+        if "refresh_token" in client.grant_types:
+            try:
+                response_body["refresh_token"] = self.refresh_tokens.issue(
+                    client_id=client_id,
+                    api_key=authorization.api_key,
+                    resource=authorization.resource,
+                )
+            except OAuthCapacityError:
+                return _token_rejection(
+                    "refresh_capacity",
+                    "temporarily_unavailable",
+                    "Server is busy. Try again.",
+                )
+
         return JSONResponse(
-            {"access_token": authorization.api_key, "token_type": "Bearer"},
+            response_body,
+            headers={"Cache-Control": "no-store", "Pragma": "no-cache"},
+        )
+
+    def _refresh_access_token(self, params: Mapping[str, str]) -> Response:
+        client_id = params.get("client_id", "")
+        client = self._client(client_id)
+        if client is None or "refresh_token" not in client.grant_types:
+            return _token_rejection("refresh_client", "invalid_grant", "Unknown client")
+
+        refresh_token = self.refresh_tokens.consume(params.get("refresh_token", ""))
+        if refresh_token is None or not hmac.compare_digest(client_id, refresh_token.client_id):
+            return _token_rejection("refresh_invalid", "invalid_grant", "Refresh token is invalid or expired")
+
+        try:
+            next_refresh_token = self.refresh_tokens.issue(
+                client_id=client_id,
+                api_key=refresh_token.api_key,
+                resource=refresh_token.resource,
+            )
+        except OAuthCapacityError:
+            return _token_rejection("refresh_capacity", "temporarily_unavailable", "Server is busy. Try again.")
+        return JSONResponse(
+            {
+                "access_token": refresh_token.api_key,
+                "token_type": "Bearer",
+                "refresh_token": next_refresh_token,
+            },
             headers={"Cache-Control": "no-store", "Pragma": "no-cache"},
         )
 
@@ -348,7 +448,7 @@ class OAuthCompatibilityServer:
                 "token_endpoint": f"{issuer}/token",
                 "registration_endpoint": f"{issuer}/register",
                 "response_types_supported": ["code"],
-                "grant_types_supported": ["authorization_code"],
+                "grant_types_supported": list(SUPPORTED_GRANT_TYPES),
                 "code_challenge_methods_supported": ["S256"],
                 "token_endpoint_auth_methods_supported": ["none"],
             }
@@ -385,17 +485,32 @@ class OAuthCompatibilityServer:
                 "redirect_uris must contain unique HTTPS or localhost callback URLs",
             )
 
+        requested_grant_types = payload.get("grant_types", ["authorization_code"])
+        if (
+            not isinstance(requested_grant_types, list)
+            or not requested_grant_types
+            or any(not isinstance(grant, str) for grant in requested_grant_types)
+            or len(set(requested_grant_types)) != len(requested_grant_types)
+            or "authorization_code" not in requested_grant_types
+            or any(grant not in SUPPORTED_GRANT_TYPES for grant in requested_grant_types)
+        ):
+            return _oauth_error(
+                "invalid_client_metadata",
+                "grant_types must contain supported authorization_code grant types",
+            )
+
         client_id = f"mcp_{secrets.token_urlsafe(24)}"
         self._registered_clients[client_id] = RegisteredClient(
             client_id=client_id,
             redirect_uris=tuple(redirect_uris),
+            grant_types=tuple(requested_grant_types),
         )
         
         response_body = {
             "client_id": client_id,
             "client_name": payload.get("client_name"),
             "redirect_uris": redirect_uris,
-            "grant_types": ["authorization_code"],
+            "grant_types": requested_grant_types,
             "response_types": ["code"],
             "token_endpoint_auth_method": "none",
         }
