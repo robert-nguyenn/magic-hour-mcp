@@ -10,6 +10,7 @@ import logging
 import os
 import re
 import secrets
+import time
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from threading import Lock
@@ -254,6 +255,7 @@ class OAuthCompatibilityServer:
             Route("/token", self.token, methods=["POST"]),
             Route("/register", self.register, methods=["POST"]),
             Route("/.well-known/oauth-authorization-server", self.authorization_server_metadata),
+            Route("/.well-known/openid-configuration", self.authorization_server_metadata),
             Route("/.well-known/oauth-protected-resource", self.protected_resource_metadata),
             Route("/.well-known/oauth-protected-resource/mcp", self.protected_resource_metadata),
         ]
@@ -451,6 +453,7 @@ class OAuthCompatibilityServer:
                 "grant_types_supported": list(SUPPORTED_GRANT_TYPES),
                 "code_challenge_methods_supported": ["S256"],
                 "token_endpoint_auth_methods_supported": ["none"],
+                "scopes_supported": [],
             }
         )
 
@@ -508,6 +511,7 @@ class OAuthCompatibilityServer:
         
         response_body = {
             "client_id": client_id,
+            "client_id_issued_at": int(time.time()),
             "client_name": payload.get("client_name"),
             "redirect_uris": redirect_uris,
             "grant_types": requested_grant_types,
