@@ -335,6 +335,17 @@ class OAuthCompatibilityServer:
         except (ValueError, UnicodeDecodeError):
             return _oauth_error("invalid_client_metadata", "Request body must be JSON")
 
+        # Log DCR request fields (exclude secrets)
+        logger.info(
+            "[DCR Request] Dynamic Client Registration received",
+            extra={
+                "dcr_request_fields": {
+                    k: v for k, v in payload.items()
+                    if k not in {"client_secret", "token"}
+                }
+            }
+        )
+
         redirect_uris = payload.get("redirect_uris") if isinstance(payload, dict) else None
         if (
             not isinstance(redirect_uris, list)
@@ -342,6 +353,10 @@ class OAuthCompatibilityServer:
             or any(not isinstance(uri, str) or not _valid_redirect_uri(uri) for uri in redirect_uris)
             or len(set(redirect_uris)) != len(redirect_uris)
         ):
+            logger.warning(
+                "[DCR] Invalid redirect_uris",
+                extra={"redirect_uris": redirect_uris}
+            )
             return _oauth_error(
                 "invalid_redirect_uri",
                 "redirect_uris must contain unique HTTPS or localhost callback URLs",
@@ -352,17 +367,26 @@ class OAuthCompatibilityServer:
             client_id=client_id,
             redirect_uris=tuple(redirect_uris),
         )
-        return JSONResponse(
-            {
-                "client_id": client_id,
-                "client_name": payload.get("client_name"),
-                "redirect_uris": redirect_uris,
-                "grant_types": ["authorization_code"],
-                "response_types": ["code"],
-                "token_endpoint_auth_method": "none",
-            },
-            status_code=201,
+        
+        response_body = {
+            "client_id": client_id,
+            "client_name": payload.get("client_name"),
+            "redirect_uris": redirect_uris,
+            "grant_types": ["authorization_code"],
+            "response_types": ["code"],
+            "token_endpoint_auth_method": "none",
+        }
+        
+        # Log DCR response (no secrets)
+        logger.info(
+            "[DCR Response] 201 Client Registered",
+            extra={
+                "dcr_response": response_body,
+                "content_type": "application/json"
+            }
         )
+        
+        return JSONResponse(response_body, status_code=201)
 
     async def protected_resource_metadata(self, request: Request) -> Response:
         issuer = self.issuer(request)
