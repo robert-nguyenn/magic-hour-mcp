@@ -623,6 +623,30 @@ class MCPBearerChallengeMiddleware:
         header = authorization or ""
         scheme, _, token = header.partition(" ")
         if scheme.lower() != "bearer" or not token.strip():
+            # The MCP client must be able to initialize and list tools before
+            # it knows which OAuth scopes a tool needs.  Let valid JSON-RPC
+            # traffic reach FastMCP; MCPToolOAuthMiddleware still challenges
+            # unauthenticated tools/call requests with mcp/www_authenticate.
+            if scope.get("method") == "POST" and scope.get("path") == "/":
+                request = Request(scope, receive)
+                body = await request.body()
+                try:
+                    message = json.loads(body)
+                    is_json_rpc = isinstance(message, dict) and "method" in message
+                except (TypeError, UnicodeDecodeError, json.JSONDecodeError):
+                    is_json_rpc = False
+                if is_json_rpc:
+                    sent = False
+
+                    async def replay_body() -> dict[str, Any]:
+                        nonlocal sent
+                        if sent:
+                            return {"type": "http.disconnect"}
+                        sent = True
+                        return {"type": "http.request", "body": body, "more_body": False}
+
+                    await self.app(scope, replay_body, send)
+                    return
             if (
                 authorization is None
                 and scope.get("method") == "GET"

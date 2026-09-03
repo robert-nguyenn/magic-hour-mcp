@@ -96,7 +96,7 @@ class OAuthCompatibilityTests(unittest.IsolatedAsyncioTestCase):
         async def mcp_endpoint(request: Request):
             return JSONResponse({"authorization": request.headers.get("authorization")})
 
-        mcp_app = Starlette(routes=[Route("/", mcp_endpoint)])
+        mcp_app = Starlette(routes=[Route("/", mcp_endpoint, methods=["GET", "POST"])])
         protected_mcp = MCPBearerChallengeMiddleware(mcp_app, self.oauth)
         self.app = Starlette(routes=[*self.oauth.routes(), Mount("/", protected_mcp)])
         self.client = httpx.AsyncClient(
@@ -435,6 +435,15 @@ class OAuthCompatibilityTests(unittest.IsolatedAsyncioTestCase):
         discovery = await self.client.post("/", headers={"Accept": "text/html"})
         self.assertNotEqual(discovery.status_code, 401)
         self.assertNotIn("www-authenticate", discovery.headers)
+
+    async def test_json_rpc_discovery_reaches_mcp_without_bearer_token(self):
+        response = await self.client.post(
+            "/",
+            json={"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), {"authorization": None})
 
     async def test_browser_get_with_invalid_authorization_receives_bearer_challenge(self):
         for authorization in ("Basic dXNlcjpwYXNz", "Bearer"):
