@@ -481,9 +481,9 @@ class OAuthCompatibilityTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(resource.json()["resource"], RESOURCE)
         self.assertEqual(resource.json()["authorization_servers"], ["https://mcp.example"])
 
-        openid_compatibility = await self.client.get("/.well-known/openid-configuration")
-        self.assertEqual(openid_compatibility.status_code, 200)
-        self.assertEqual(openid_compatibility.json()["issuer"], "https://mcp.example")
+        openid_configuration = await self.client.get("/.well-known/openid-configuration")
+        self.assertEqual(openid_configuration.status_code, 404)
+        self.assertEqual(openid_configuration.json()["error"], "not_supported")
 
     async def test_dynamic_client_registration_supports_custom_connector_callback(self):
         registration = await self.client.post(

@@ -263,7 +263,7 @@ class OAuthCompatibilityServer:
             Route("/token", self.token, methods=["POST"]),
             Route("/register", self.register, methods=["POST"]),
             Route("/.well-known/oauth-authorization-server", self.authorization_server_metadata),
-            Route("/.well-known/openid-configuration", self.authorization_server_metadata),
+            Route("/.well-known/openid-configuration", self.openid_configuration),
             Route("/.well-known/oauth-protected-resource", self.protected_resource_metadata),
             Route("/.well-known/oauth-protected-resource/mcp", self.protected_resource_metadata),
         ]
@@ -547,6 +547,13 @@ class OAuthCompatibilityServer:
         )
         
         return JSONResponse(response_body, status_code=201)
+
+    async def openid_configuration(self, request: Request) -> Response:
+        """This server is an OAuth authorization server, not an OIDC provider."""
+        return JSONResponse(
+            {"error": "not_supported", "error_description": "OpenID Connect is not supported"},
+            status_code=404,
+        )
 
     async def protected_resource_metadata(self, request: Request) -> Response:
         issuer = self.issuer(request)
