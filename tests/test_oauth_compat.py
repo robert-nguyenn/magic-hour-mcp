@@ -151,7 +151,10 @@ class OAuthCompatibilityTests(unittest.IsolatedAsyncioTestCase):
         }
         token = await self.client.post("/token", data=token_request)
         self.assertEqual(token.status_code, 200)
-        self.assertEqual(token.json(), {"access_token": "sk_valid", "token_type": "Bearer"})
+        self.assertEqual(
+            token.json(),
+            {"access_token": "sk_valid", "token_type": "Bearer", "scope": "mcp"},
+        )
         self.assertEqual(token.headers["cache-control"], "no-store")
 
         replay = await self.client.post("/token", data=token_request)
@@ -358,7 +361,7 @@ class OAuthCompatibilityTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(token.status_code, 200)
                 self.assertEqual(
                     token.json(),
-                    {"access_token": "sk_valid", "token_type": "Bearer"},
+                    {"access_token": "sk_valid", "token_type": "Bearer", "scope": "mcp"},
                 )
 
     async def test_pkce_failure_does_not_redeem_authorization_code(self):
@@ -433,8 +436,8 @@ class OAuthCompatibilityTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("resource_metadata=", response.headers["www-authenticate"])
 
         discovery = await self.client.post("/", headers={"Accept": "text/html"})
-        self.assertNotEqual(discovery.status_code, 401)
-        self.assertNotIn("www-authenticate", discovery.headers)
+        self.assertEqual(discovery.status_code, 401)
+        self.assertIn("resource_metadata=", discovery.headers["www-authenticate"])
 
     async def test_json_rpc_discovery_reaches_mcp_without_bearer_token(self):
         response = await self.client.post(
@@ -521,7 +524,10 @@ class OAuthCompatibilityTests(unittest.IsolatedAsyncioTestCase):
             },
         )
         self.assertEqual(token.status_code, 200)
-        self.assertEqual(token.json(), {"access_token": "sk_valid", "token_type": "Bearer"})
+        self.assertEqual(
+            token.json(),
+            {"access_token": "sk_valid", "token_type": "Bearer", "scope": "mcp"},
+        )
 
     async def test_dynamic_registration_preserves_supported_refresh_grant(self):
         registration = await self.client.post(
@@ -545,6 +551,7 @@ class OAuthCompatibilityTests(unittest.IsolatedAsyncioTestCase):
             metadata.json()["grant_types_supported"],
             ["authorization_code", "refresh_token"],
         )
+        self.assertEqual(metadata.json()["scopes_supported"], ["mcp", "offline_access"])
 
     async def test_dynamic_registration_rejects_insecure_or_query_callback(self):
         for redirect_uri in (

@@ -51,7 +51,10 @@ PKCE_RE = re.compile(r"^[A-Za-z0-9._~-]{43,128}$")
 CHALLENGE_RE = re.compile(r"^[A-Za-z0-9_-]{43}$")
 ApiKeyValidator = Callable[[str], Awaitable[bool]]
 logger = logging.getLogger("uvicorn.error.mcp_oauth")
-OAUTH_SECURITY_SCHEMES = [{"type": "oauth2", "scopes": []}]
+MCP_SCOPE = "mcp"
+OFFLINE_ACCESS_SCOPE = "offline_access"
+SUPPORTED_OAUTH_SCOPES = (MCP_SCOPE, OFFLINE_ACCESS_SCOPE)
+OAUTH_SECURITY_SCHEMES = [{"type": "oauth2", "scopes": [MCP_SCOPE]}]
 SUPPORTED_GRANT_TYPES = ("authorization_code", "refresh_token")
 _DCR_SECRET_FIELDS = frozenset(
     {
@@ -90,6 +93,7 @@ class AuthorizationCode:
     redirect_uri: str
     code_challenge: str
     resource: str | None
+    scope: str
     expires_at: float
 
 
@@ -105,6 +109,7 @@ class RefreshToken:
     client_id: str
     api_key: str
     resource: str | None
+    scope: str
     expires_at: float
 
 
@@ -124,6 +129,7 @@ class AuthorizationCodeStore:
         redirect_uri: str,
         code_challenge: str,
         resource: str | None,
+        scope: str = MCP_SCOPE,
     ) -> str:
         code = secrets.token_urlsafe(32)
         now = monotonic()
@@ -133,6 +139,7 @@ class AuthorizationCodeStore:
             redirect_uri=redirect_uri,
             code_challenge=code_challenge,
             resource=resource,
+            scope=scope,
             expires_at=now + self.ttl_seconds,
         )
         with self._lock:
@@ -182,7 +189,7 @@ class RefreshTokenStore:
         self._tokens: dict[str, RefreshToken] = {}
         self._lock = Lock()
 
-    def issue(self, *, client_id: str, api_key: str, resource: str | None) -> str:
+    def issue(self, *, client_id: str, api_key: str, resource: str | None, scope: str) -> str:
         token = secrets.token_urlsafe(48)
         now = monotonic()
         with self._lock:
@@ -193,6 +200,7 @@ class RefreshTokenStore:
                 client_id=client_id,
                 api_key=api_key,
                 resource=resource,
+                scope=scope,
                 expires_at=now + self.ttl_seconds,
             )
         return token
@@ -309,6 +317,7 @@ class OAuthCompatibilityServer:
                 redirect_uri=authorization["redirect_uri"],
                 code_challenge=authorization["code_challenge"],
                 resource=authorization["resource"],
+                scope=authorization["scope"],
             )
         except OAuthCapacityError:
             return _authorization_page(page_params, "Server is busy. Try again.", status_code=503)
@@ -394,6 +403,7 @@ class OAuthCompatibilityServer:
         response_body: dict[str, str] = {
             "access_token": authorization.api_key,
             "token_type": "Bearer",
+            "scope": authorization.scope,
         }
         if "refresh_token" in client.grant_types:
             try:
@@ -401,6 +411,7 @@ class OAuthCompatibilityServer:
                     client_id=client_id,
                     api_key=authorization.api_key,
                     resource=authorization.resource,
+                    scope=authorization.scope,
                 )
             except OAuthCapacityError:
                 return _token_rejection(
@@ -429,6 +440,7 @@ class OAuthCompatibilityServer:
                 client_id=client_id,
                 api_key=refresh_token.api_key,
                 resource=refresh_token.resource,
+                scope=refresh_token.scope,
             )
         except OAuthCapacityError:
             return _token_rejection("refresh_capacity", "temporarily_unavailable", "Server is busy. Try again.")
@@ -437,6 +449,7 @@ class OAuthCompatibilityServer:
                 "access_token": refresh_token.api_key,
                 "token_type": "Bearer",
                 "refresh_token": next_refresh_token,
+                "scope": refresh_token.scope,
             },
             headers={"Cache-Control": "no-store", "Pragma": "no-cache"},
         )
@@ -453,7 +466,7 @@ class OAuthCompatibilityServer:
                 "grant_types_supported": list(SUPPORTED_GRANT_TYPES),
                 "code_challenge_methods_supported": ["S256"],
                 "token_endpoint_auth_methods_supported": ["none"],
-                "scopes_supported": [],
+                "scopes_supported": list(SUPPORTED_OAUTH_SCOPES),
             }
         )
 
@@ -560,6 +573,7 @@ class OAuthCompatibilityServer:
         redirect_uri = params.get("redirect_uri", "")
         challenge = params.get("code_challenge", "")
         resource = params.get("resource")
+        requested_scopes = tuple(dict.fromkeys(params.get("scope", "").split())) or (MCP_SCOPE,)
 
         if params.get("response_type") != "code":
             raise OAuthRequestError("unsupported_response_type", "response_type must be code")
@@ -570,12 +584,15 @@ class OAuthCompatibilityServer:
             raise OAuthRequestError("invalid_request", "PKCE S256 code_challenge is required")
         if resource and not _same_resource(resource, expected_resource):
             raise OAuthRequestError("invalid_target", "Unknown resource")
+        if any(scope not in SUPPORTED_OAUTH_SCOPES for scope in requested_scopes):
+            raise OAuthRequestError("invalid_scope", "Requested scope is not supported")
 
         return {
             "client_id": client_id,
             "redirect_uri": redirect_uri,
             "code_challenge": challenge,
             "resource": resource,
+            "scope": " ".join(requested_scopes),
         }
 
     def _client(self, client_id: str) -> RegisteredClient | None:
