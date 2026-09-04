@@ -5,6 +5,32 @@ Use this when mounting the server into an existing FastAPI app.
 For a numbered walkthrough, use `docs/detailed-step-by-step-integration.md`.
 For instructions written for a coding agent, use `docs/ai-agent-go-live-instructions.md`.
 
+## ChatGPT Business OAuth handoff (September 2026)
+
+- Review branch: `chatgpt-integration`
+- Stable test URL: `https://magic-hour-mcp-oauth-test.vercel.app`
+- OAuth support includes protected-resource and authorization-server discovery,
+  DCR, authorization-code/refresh-token grants, PKCE S256, public-client token
+  authentication (`none`), and `mcp` / `offline_access` scopes.
+- The server is OAuth-only; `/.well-known/openid-configuration` returns `404`.
+  Do not add a placeholder OIDC document or userinfo endpoint.
+- Unauthenticated valid MCP JSON-RPC discovery requests may reach FastMCP so a
+  client can initialize and list tools. Actual `tools/call` requests remain
+  challenged through OAuth middleware.
+
+### Current platform blocker
+
+ChatGPT Business successfully discovers the OAuth metadata and receives a
+`201` response from `POST /register`, but then sends no `/authorize`, `/token`,
+MCP `initialize`, or MCP `tools/list` request. The resulting DEV app has zero
+actions. The documented **Scan Tools** control is absent in this workspace UI.
+
+OpenAI Support case **14263640** confirmed there is no supported manual way to
+trigger initial tool scanning or enable it for an individual workspace. Do not
+publish a zero-action draft or add further server workarounds. Resume only when
+OpenAI provides a product fix or a supported scan path; then recreate the draft
+app and watch Vercel logs for authorization followed by MCP discovery.
+
 ## What to mount
 
 - Import `app` from `mcp_magichour.server`

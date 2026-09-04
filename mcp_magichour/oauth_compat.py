@@ -56,32 +56,6 @@ OFFLINE_ACCESS_SCOPE = "offline_access"
 SUPPORTED_OAUTH_SCOPES = (MCP_SCOPE, OFFLINE_ACCESS_SCOPE)
 OAUTH_SECURITY_SCHEMES = [{"type": "oauth2", "scopes": [MCP_SCOPE]}]
 SUPPORTED_GRANT_TYPES = ("authorization_code", "refresh_token")
-_DCR_SECRET_FIELDS = frozenset(
-    {
-        "client_secret",
-        "client_secret_expires_at",
-        "registration_access_token",
-        "token",
-        "access_token",
-        "refresh_token",
-    }
-)
-
-
-def _redact_dcr_data(value: Any) -> Any:
-    """Return DCR diagnostic data without exposing credentials or tokens."""
-    if isinstance(value, Mapping):
-        return {
-            str(key): "[REDACTED]"
-            if str(key).lower() in _DCR_SECRET_FIELDS
-            else _redact_dcr_data(item)
-            for key, item in value.items()
-        }
-    if isinstance(value, (list, tuple)):
-        return [_redact_dcr_data(item) for item in value]
-    return value
-
-
 class OAuthCapacityError(Exception):
     pass
 
@@ -476,15 +450,6 @@ class OAuthCompatibilityServer:
         except (ValueError, UnicodeDecodeError):
             return _oauth_error("invalid_client_metadata", "Request body must be JSON")
 
-        # Vercel does not reliably emit INFO-level Python loggers.  Print from
-        # the actual DCR handler, flushing immediately, so this trace is tied
-        # to the /register invocation in Live Logs.  Never include secrets.
-        print(
-            "[DCR-ACTUAL-HANDLER] request "
-            + json.dumps(_redact_dcr_data(payload), sort_keys=True, default=str),
-            flush=True,
-        )
-
         redirect_uris = payload.get("redirect_uris") if isinstance(payload, dict) else None
         if (
             not isinstance(redirect_uris, list)
@@ -521,7 +486,6 @@ class OAuthCompatibilityServer:
             redirect_uris=tuple(redirect_uris),
             grant_types=tuple(requested_grant_types),
         )
-        
         response_body = {
             "client_id": client_id,
             "client_id_issued_at": int(time.time()),
@@ -531,21 +495,6 @@ class OAuthCompatibilityServer:
             "response_types": ["code"],
             "token_endpoint_auth_method": "none",
         }
-        
-        print(
-            "[DCR-ACTUAL-HANDLER] response "
-            + json.dumps(
-                {
-                    "status": 201,
-                    "content_type": "application/json",
-                    "body": _redact_dcr_data(response_body),
-                },
-                sort_keys=True,
-                default=str,
-            ),
-            flush=True,
-        )
-        
         return JSONResponse(response_body, status_code=201)
 
     async def openid_configuration(self, request: Request) -> Response:
