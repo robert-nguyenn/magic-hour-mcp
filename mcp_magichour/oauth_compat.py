@@ -5,10 +5,12 @@ import base64
 import hashlib
 import hmac
 import html
+import json
 import logging
 import os
 import re
 import secrets
+import time
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from threading import Lock
@@ -30,8 +32,10 @@ from .openapi_auth import AuthError, current_authorization_header
 
 
 CODE_TTL_SECONDS = 300
+REFRESH_TOKEN_TTL_SECONDS = 30 * 24 * 60 * 60
 MAX_FORM_BYTES = 16 * 1024
 MAX_PENDING_CODES = 1_000
+MAX_PENDING_REFRESH_TOKENS = 10_000
 MAX_CODES_PER_API_KEY = 3
 MAX_CONCURRENT_VALIDATIONS = 10
 API_KEY_VERIFICATION_ERROR = (
@@ -47,19 +51,39 @@ PKCE_RE = re.compile(r"^[A-Za-z0-9._~-]{43,128}$")
 CHALLENGE_RE = re.compile(r"^[A-Za-z0-9_-]{43}$")
 ApiKeyValidator = Callable[[str], Awaitable[bool]]
 logger = logging.getLogger("uvicorn.error.mcp_oauth")
-OAUTH_SECURITY_SCHEMES = [{"type": "oauth2", "scopes": []}]
-
-
+MCP_SCOPE = "mcp"
+OFFLINE_ACCESS_SCOPE = "offline_access"
+SUPPORTED_OAUTH_SCOPES = (MCP_SCOPE, OFFLINE_ACCESS_SCOPE)
+OAUTH_SECURITY_SCHEMES = [{"type": "oauth2", "scopes": [MCP_SCOPE]}]
+SUPPORTED_GRANT_TYPES = ("authorization_code", "refresh_token")
 class OAuthCapacityError(Exception):
     pass
 
 
 @dataclass(frozen=True)
 class AuthorizationCode:
+    client_id: str
     api_key: str
     redirect_uri: str
     code_challenge: str
     resource: str | None
+    scope: str
+    expires_at: float
+
+
+@dataclass(frozen=True)
+class RegisteredClient:
+    client_id: str
+    redirect_uris: tuple[str, ...]
+    grant_types: tuple[str, ...] = ("authorization_code",)
+
+
+@dataclass(frozen=True)
+class RefreshToken:
+    client_id: str
+    api_key: str
+    resource: str | None
+    scope: str
     expires_at: float
 
 
@@ -74,18 +98,22 @@ class AuthorizationCodeStore:
     def issue(
         self,
         *,
+        client_id: str = OAUTH_CLIENT_ID,
         api_key: str,
         redirect_uri: str,
         code_challenge: str,
         resource: str | None,
+        scope: str = MCP_SCOPE,
     ) -> str:
         code = secrets.token_urlsafe(32)
         now = monotonic()
         authorization_code = AuthorizationCode(
+            client_id=client_id,
             api_key=api_key,
             redirect_uri=redirect_uri,
             code_challenge=code_challenge,
             resource=resource,
+            scope=scope,
             expires_at=now + self.ttl_seconds,
         )
         with self._lock:
@@ -127,6 +155,45 @@ class AuthorizationCodeStore:
                 del self._codes[code]
 
 
+class RefreshTokenStore:
+    """Small process-local, rotating refresh-token store."""
+
+    def __init__(self, ttl_seconds: int = REFRESH_TOKEN_TTL_SECONDS) -> None:
+        self.ttl_seconds = ttl_seconds
+        self._tokens: dict[str, RefreshToken] = {}
+        self._lock = Lock()
+
+    def issue(self, *, client_id: str, api_key: str, resource: str | None, scope: str) -> str:
+        token = secrets.token_urlsafe(48)
+        now = monotonic()
+        with self._lock:
+            self._remove_expired(now)
+            if len(self._tokens) >= MAX_PENDING_REFRESH_TOKENS:
+                raise OAuthCapacityError
+            self._tokens[token] = RefreshToken(
+                client_id=client_id,
+                api_key=api_key,
+                resource=resource,
+                scope=scope,
+                expires_at=now + self.ttl_seconds,
+            )
+        return token
+
+    def consume(self, token: str) -> RefreshToken | None:
+        now = monotonic()
+        with self._lock:
+            refresh_token = self._tokens.pop(token, None)
+            self._remove_expired(now)
+        if refresh_token is None or refresh_token.expires_at <= now:
+            return None
+        return refresh_token
+
+    def _remove_expired(self, now: float) -> None:
+        for token, value in list(self._tokens.items()):
+            if value.expires_at <= now:
+                del self._tokens[token]
+
+
 @dataclass(frozen=True)
 class OAuthSettings:
     issuer_url: str | None = None
@@ -154,18 +221,23 @@ class OAuthCompatibilityServer:
         settings: OAuthSettings | None = None,
         api_key_validator: ApiKeyValidator | None = None,
         code_store: AuthorizationCodeStore | None = None,
+        refresh_token_store: RefreshTokenStore | None = None,
     ) -> None:
         self.settings = settings or OAuthSettings.from_env()
         _validate_settings(self.settings)
         self.codes = code_store or AuthorizationCodeStore()
+        self.refresh_tokens = refresh_token_store or RefreshTokenStore()
         self.validate_api_key = api_key_validator or self._validate_api_key
         self._validation_slots = asyncio.Semaphore(MAX_CONCURRENT_VALIDATIONS)
+        self._registered_clients: dict[str, RegisteredClient] = {}
 
     def routes(self) -> list[Route]:
         return [
             Route("/authorize", self.authorize, methods=["GET", "POST"]),
             Route("/token", self.token, methods=["POST"]),
+            Route("/register", self.register, methods=["POST"]),
             Route("/.well-known/oauth-authorization-server", self.authorization_server_metadata),
+            Route("/.well-known/openid-configuration", self.openid_configuration),
             Route("/.well-known/oauth-protected-resource", self.protected_resource_metadata),
             Route("/.well-known/oauth-protected-resource/mcp", self.protected_resource_metadata),
         ]
@@ -214,10 +286,12 @@ class OAuthCompatibilityServer:
 
         try:
             code = self.codes.issue(
+                client_id=authorization["client_id"],
                 api_key=api_key,
                 redirect_uri=authorization["redirect_uri"],
                 code_challenge=authorization["code_challenge"],
                 resource=authorization["resource"],
+                scope=authorization["scope"],
             )
         except OAuthCapacityError:
             return _authorization_page(page_params, "Server is busy. Try again.", status_code=503)
@@ -230,11 +304,14 @@ class OAuthCompatibilityServer:
         except OAuthRequestError as error:
             return _token_rejection("malformed_form", error.error, error.description)
 
-        if params.get("grant_type") != "authorization_code":
+        grant_type = params.get("grant_type")
+        if grant_type == "refresh_token":
+            return self._refresh_access_token(params)
+        if grant_type != "authorization_code":
             return _token_rejection(
                 "unsupported_grant_type",
                 "unsupported_grant_type",
-                "grant_type must be authorization_code",
+                "grant_type must be authorization_code or refresh_token",
             )
 
         code = params.get("code", "")
@@ -246,7 +323,15 @@ class OAuthCompatibilityServer:
                 "Authorization code is invalid or expired",
             )
 
-        if not hmac.compare_digest(params.get("client_id", ""), OAUTH_CLIENT_ID):
+        client_id = params.get("client_id", "")
+        client = self._client(client_id)
+        if client is None:
+            return _token_rejection(
+                "client_mismatch",
+                "invalid_grant",
+                "Authorization code does not match client",
+            )
+        if not hmac.compare_digest(client_id, authorization.client_id):
             return _token_rejection(
                 "client_mismatch",
                 "invalid_grant",
@@ -289,8 +374,57 @@ class OAuthCompatibilityServer:
                 "Authorization code is invalid or expired",
             )
 
+        response_body: dict[str, str] = {
+            "access_token": authorization.api_key,
+            "token_type": "Bearer",
+            "scope": authorization.scope,
+        }
+        if "refresh_token" in client.grant_types:
+            try:
+                response_body["refresh_token"] = self.refresh_tokens.issue(
+                    client_id=client_id,
+                    api_key=authorization.api_key,
+                    resource=authorization.resource,
+                    scope=authorization.scope,
+                )
+            except OAuthCapacityError:
+                return _token_rejection(
+                    "refresh_capacity",
+                    "temporarily_unavailable",
+                    "Server is busy. Try again.",
+                )
+
         return JSONResponse(
-            {"access_token": authorization.api_key, "token_type": "Bearer"},
+            response_body,
+            headers={"Cache-Control": "no-store", "Pragma": "no-cache"},
+        )
+
+    def _refresh_access_token(self, params: Mapping[str, str]) -> Response:
+        client_id = params.get("client_id", "")
+        client = self._client(client_id)
+        if client is None or "refresh_token" not in client.grant_types:
+            return _token_rejection("refresh_client", "invalid_grant", "Unknown client")
+
+        refresh_token = self.refresh_tokens.consume(params.get("refresh_token", ""))
+        if refresh_token is None or not hmac.compare_digest(client_id, refresh_token.client_id):
+            return _token_rejection("refresh_invalid", "invalid_grant", "Refresh token is invalid or expired")
+
+        try:
+            next_refresh_token = self.refresh_tokens.issue(
+                client_id=client_id,
+                api_key=refresh_token.api_key,
+                resource=refresh_token.resource,
+                scope=refresh_token.scope,
+            )
+        except OAuthCapacityError:
+            return _token_rejection("refresh_capacity", "temporarily_unavailable", "Server is busy. Try again.")
+        return JSONResponse(
+            {
+                "access_token": refresh_token.api_key,
+                "token_type": "Bearer",
+                "refresh_token": next_refresh_token,
+                "scope": refresh_token.scope,
+            },
             headers={"Cache-Control": "no-store", "Pragma": "no-cache"},
         )
 
@@ -301,11 +435,73 @@ class OAuthCompatibilityServer:
                 "issuer": issuer,
                 "authorization_endpoint": f"{issuer}/authorize",
                 "token_endpoint": f"{issuer}/token",
+                "registration_endpoint": f"{issuer}/register",
                 "response_types_supported": ["code"],
-                "grant_types_supported": ["authorization_code"],
+                "grant_types_supported": list(SUPPORTED_GRANT_TYPES),
                 "code_challenge_methods_supported": ["S256"],
                 "token_endpoint_auth_methods_supported": ["none"],
+                "scopes_supported": list(SUPPORTED_OAUTH_SCOPES),
             }
+        )
+
+    async def register(self, request: Request) -> Response:
+        try:
+            payload = await request.json()
+        except (ValueError, UnicodeDecodeError):
+            return _oauth_error("invalid_client_metadata", "Request body must be JSON")
+
+        redirect_uris = payload.get("redirect_uris") if isinstance(payload, dict) else None
+        if (
+            not isinstance(redirect_uris, list)
+            or not redirect_uris
+            or any(not isinstance(uri, str) or not _valid_redirect_uri(uri) for uri in redirect_uris)
+            or len(set(redirect_uris)) != len(redirect_uris)
+        ):
+            logger.warning(
+                "[DCR] Invalid redirect_uris",
+                extra={"redirect_uris": redirect_uris}
+            )
+            return _oauth_error(
+                "invalid_redirect_uri",
+                "redirect_uris must contain unique HTTPS or localhost callback URLs",
+            )
+
+        requested_grant_types = payload.get("grant_types", ["authorization_code"])
+        if (
+            not isinstance(requested_grant_types, list)
+            or not requested_grant_types
+            or any(not isinstance(grant, str) for grant in requested_grant_types)
+            or len(set(requested_grant_types)) != len(requested_grant_types)
+            or "authorization_code" not in requested_grant_types
+            or any(grant not in SUPPORTED_GRANT_TYPES for grant in requested_grant_types)
+        ):
+            return _oauth_error(
+                "invalid_client_metadata",
+                "grant_types must contain supported authorization_code grant types",
+            )
+
+        client_id = f"mcp_{secrets.token_urlsafe(24)}"
+        self._registered_clients[client_id] = RegisteredClient(
+            client_id=client_id,
+            redirect_uris=tuple(redirect_uris),
+            grant_types=tuple(requested_grant_types),
+        )
+        response_body = {
+            "client_id": client_id,
+            "client_id_issued_at": int(time.time()),
+            "client_name": payload.get("client_name"),
+            "redirect_uris": redirect_uris,
+            "grant_types": requested_grant_types,
+            "response_types": ["code"],
+            "token_endpoint_auth_method": "none",
+        }
+        return JSONResponse(response_body, status_code=201)
+
+    async def openid_configuration(self, request: Request) -> Response:
+        """This server is an OAuth authorization server, not an OIDC provider."""
+        return JSONResponse(
+            {"error": "not_supported", "error_description": "OpenID Connect is not supported"},
+            status_code=404,
         )
 
     async def protected_resource_metadata(self, request: Request) -> Response:
@@ -333,22 +529,32 @@ class OAuthCompatibilityServer:
         redirect_uri = params.get("redirect_uri", "")
         challenge = params.get("code_challenge", "")
         resource = params.get("resource")
+        requested_scopes = tuple(dict.fromkeys(params.get("scope", "").split())) or (MCP_SCOPE,)
 
         if params.get("response_type") != "code":
             raise OAuthRequestError("unsupported_response_type", "response_type must be code")
-        if client_id != OAUTH_CLIENT_ID or redirect_uri not in ALLOWED_REDIRECT_URIS:
+        client = self._client(client_id)
+        if client is None or redirect_uri not in client.redirect_uris:
             raise OAuthRequestError("invalid_request", "Unknown client or redirect_uri")
         if params.get("code_challenge_method") != "S256" or not CHALLENGE_RE.fullmatch(challenge):
             raise OAuthRequestError("invalid_request", "PKCE S256 code_challenge is required")
         if resource and not _same_resource(resource, expected_resource):
             raise OAuthRequestError("invalid_target", "Unknown resource")
+        if any(scope not in SUPPORTED_OAUTH_SCOPES for scope in requested_scopes):
+            raise OAuthRequestError("invalid_scope", "Requested scope is not supported")
 
         return {
             "client_id": client_id,
             "redirect_uri": redirect_uri,
             "code_challenge": challenge,
             "resource": resource,
+            "scope": " ".join(requested_scopes),
         }
+
+    def _client(self, client_id: str) -> RegisteredClient | None:
+        if client_id == OAUTH_CLIENT_ID:
+            return RegisteredClient(client_id=client_id, redirect_uris=tuple(ALLOWED_REDIRECT_URIS))
+        return self._registered_clients.get(client_id)
 
     async def _validate_api_key(self, api_key: str) -> bool:
         async with httpx.AsyncClient(base_url=self.settings.api_base_url, timeout=10.0) as client:
@@ -379,7 +585,7 @@ class MCPBearerChallengeMiddleware:
             await self.app(scope, receive, send)
             return
 
-        if scope.get("method") in {"OPTIONS", "POST"}:
+        if scope.get("method") == "OPTIONS":
             await self.app(scope, receive, send)
             return
 
@@ -390,6 +596,30 @@ class MCPBearerChallengeMiddleware:
         header = authorization or ""
         scheme, _, token = header.partition(" ")
         if scheme.lower() != "bearer" or not token.strip():
+            # The MCP client must be able to initialize and list tools before
+            # it knows which OAuth scopes a tool needs.  Let valid JSON-RPC
+            # traffic reach FastMCP; MCPToolOAuthMiddleware still challenges
+            # unauthenticated tools/call requests with mcp/www_authenticate.
+            if scope.get("method") == "POST" and scope.get("path") == "/":
+                request = Request(scope, receive)
+                body = await request.body()
+                try:
+                    message = json.loads(body)
+                    is_json_rpc = isinstance(message, dict) and "method" in message
+                except (TypeError, UnicodeDecodeError, json.JSONDecodeError):
+                    is_json_rpc = False
+                if is_json_rpc:
+                    sent = False
+
+                    async def replay_body() -> dict[str, Any]:
+                        nonlocal sent
+                        if sent:
+                            return {"type": "http.disconnect"}
+                        sent = True
+                        return {"type": "http.request", "body": body, "more_body": False}
+
+                    await self.app(scope, replay_body, send)
+                    return
             if (
                 authorization is None
                 and scope.get("method") == "GET"
@@ -640,7 +870,7 @@ def _authorization_page(
       <a href="https://magichour.ai/developer?tab=api-keys" target="_blank" rel="noopener noreferrer">Create your API key</a>
     </div>
     <div class="api-key-control">
-      <input id="api-key" name="api_key" type="password" placeholder="mhk_live_…" required autocomplete="new-password" autocapitalize="none" spellcheck="false" data-1p-ignore="true" data-lpignore="true" data-bwignore="true" autofocus{error_attributes}>
+    <input id="api-key" name="api_key" type="password" placeholder="mhk_live_…" required autocomplete="off" autocapitalize="none" spellcheck="false" data-1p-ignore="true" data-lpignore="true" data-bwignore="true" autofocus{error_attributes}>
       <button id="api-key-visibility" class="visibility-toggle" type="button" aria-label="Show API key" aria-pressed="false">Show</button>
     </div>
     {error_html}
@@ -742,6 +972,10 @@ def _valid_server_url(uri: str) -> bool:
     if parts.scheme == "https":
         return True
     return parts.scheme == "http" and parts.hostname in {"localhost", "127.0.0.1", "::1"}
+
+
+def _valid_redirect_uri(uri: str) -> bool:
+    return _valid_server_url(uri)
 
 
 def _validate_settings(settings: OAuthSettings) -> None:
