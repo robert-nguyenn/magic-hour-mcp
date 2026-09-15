@@ -1,5 +1,6 @@
 import json
 import unittest
+from unittest.mock import AsyncMock, patch
 
 import httpx
 
@@ -7,6 +8,17 @@ from mcp_magichour.openapi_server import app
 
 
 class MCPErrorTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        # Invalid MCP requests must be rejected locally, never sent to Magic Hour.
+        outbound = patch(
+            "httpx.AsyncHTTPTransport.handle_async_request",
+            new_callable=AsyncMock,
+            side_effect=AssertionError("Invalid MCP request reached the network"),
+        )
+        transport = outbound.start()
+        self.addCleanup(outbound.stop)
+        self.addCleanup(transport.assert_not_awaited)
+
     async def call_tool(self, name: str, arguments: dict, *, authorized: bool = True) -> dict:
         headers = {"Accept": "application/json, text/event-stream"}
         if authorized:

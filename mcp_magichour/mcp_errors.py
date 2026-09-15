@@ -3,12 +3,12 @@ from __future__ import annotations
 import jsonschema
 import mcp.types as mt
 from fastmcp import FastMCP
-from mcp.shared.exceptions import MCPError as McpError
+from mcp.shared.exceptions import McpError
 
 
 def install_structured_tool_errors(mcp: FastMCP) -> None:
     try:
-        handler = mcp._mcp_server._request_handlers[mt.CallToolRequest]
+        handler = mcp._mcp_server.request_handlers[mt.CallToolRequest]
     except (AttributeError, KeyError):
         # Attribute or handler not available in this MCP version
         return
@@ -28,7 +28,7 @@ def install_structured_tool_errors(mcp: FastMCP) -> None:
         return await handler(request)
 
     try:
-        mcp._mcp_server._request_handlers[mt.CallToolRequest] = handle
+        mcp._mcp_server.request_handlers[mt.CallToolRequest] = handle
     except (AttributeError, KeyError):
         # Attribute or handler not available in this MCP version
         pass
