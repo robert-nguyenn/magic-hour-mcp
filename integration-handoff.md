@@ -5,6 +5,67 @@ Use this when mounting the server into an existing FastAPI app.
 For a numbered walkthrough, use `docs/detailed-step-by-step-integration.md`.
 For instructions written for a coding agent, use `docs/ai-agent-go-live-instructions.md`.
 
+## ChatGPT Business OAuth handoff (September 2026)
+
+- Review branch: `chatgpt-integration`
+- Stable test URL: `https://magic-hour-mcp-oauth-test.vercel.app`
+- OAuth support includes protected-resource and authorization-server discovery,
+  DCR, authorization-code/refresh-token grants, PKCE S256, public-client token
+  authentication (`none`), and `mcp` / `offline_access` scopes.
+- The server is OAuth-only; `/.well-known/openid-configuration` returns `404`.
+  Do not add a placeholder OIDC document or userinfo endpoint.
+- Unauthenticated valid MCP JSON-RPC discovery requests may reach FastMCP so a
+  client can initialize and list tools. Actual `tools/call` requests remain
+  challenged through OAuth middleware.
+
+### September 15 update: server fixes and retest
+
+The earlier conclusion that the zero-action draft was exclusively a ChatGPT
+platform blocker was premature. Rhythm's commit `9aa762f` fixes two server-side
+failures: request-body replay incorrectly signalled a client disconnect (empty
+SSE responses), and tool listing assigned an unsupported SDK `securitySchemes`
+field. The branch includes that commit and pins `fastmcp==3.4.7`.
+
+Local validation also exposed two SDK naming mismatches in structured-error
+handling. The SDK uses `McpError` and `request_handlers`, not `MCPError` and
+`_request_handlers`. These are corrected so the server starts and invalid tool
+arguments are rejected locally. Tests explicitly prohibit outgoing HTTP requests
+for malformed tool calls.
+
+The previous reproduction showed successful discovery and DCR (`201`) followed
+by an empty action list. Support case **14263640** remains useful historical
+context, but does not establish the cause or prove the server was correct.
+The absence of a separate Scan Tools button alone is not a conclusive failure.
+
+Next: deploy this branch to the Vercel **Preview/test** project, confirm that
+`https://magic-hour-mcp-oauth-test.vercel.app` points to the new deployment, then
+recreate the ChatGPT OAuth app. Follow the Connect/Refresh controls available in
+that workspace, complete authorization, and verify that actions appear. This is
+Rhythm's suggested retest path; success still requires an actual workspace test.
+Do not publish a zero-action draft or merge PR #1 into main as part of this update.
+
+### Local verification
+
+September 15 results: all 55 tests pass with FastMCP 3.4.7 on both MCP SDK
+1.29.1 (existing environment) and 1.30.0 (fresh Python 3.12 environment).
+The fresh environment passes `pip check`; the web typecheck/build also passes.
+The existing frontend dependencies report two moderate npm audit advisories;
+those are outside this focused Python compatibility change.
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -e .
+npm --prefix web ci
+npm --prefix web run build
+.\.venv\Scripts\python.exe -m unittest discover -s tests -v
+.\.venv\Scripts\python.exe -m pip check
+```
+
+The web build is required before the HTTP-view/asset tests. Tests use Python's
+built-in `unittest`; installing `pytest` is unnecessary. The FastMCP pin does not
+lock every transitive dependency. Record resolved SDK versions with test results
+when upgrading; avoid inferring deployment health from an installed version alone.
+
 ## What to mount
 
 - Import `app` from `mcp_magichour.server`

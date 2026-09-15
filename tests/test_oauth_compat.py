@@ -96,7 +96,7 @@ class OAuthCompatibilityTests(unittest.IsolatedAsyncioTestCase):
         async def mcp_endpoint(request: Request):
             return JSONResponse({"authorization": request.headers.get("authorization")})
 
-        mcp_app = Starlette(routes=[Route("/", mcp_endpoint)])
+        mcp_app = Starlette(routes=[Route("/", mcp_endpoint, methods=["GET", "POST"])])
         protected_mcp = MCPBearerChallengeMiddleware(mcp_app, self.oauth)
         self.app = Starlette(routes=[*self.oauth.routes(), Mount("/", protected_mcp)])
         self.client = httpx.AsyncClient(
@@ -151,7 +151,10 @@ class OAuthCompatibilityTests(unittest.IsolatedAsyncioTestCase):
         }
         token = await self.client.post("/token", data=token_request)
         self.assertEqual(token.status_code, 200)
-        self.assertEqual(token.json(), {"access_token": "sk_valid", "token_type": "Bearer"})
+        self.assertEqual(
+            token.json(),
+            {"access_token": "sk_valid", "token_type": "Bearer", "scope": "mcp"},
+        )
         self.assertEqual(token.headers["cache-control"], "no-store")
 
         replay = await self.client.post("/token", data=token_request)
@@ -358,7 +361,7 @@ class OAuthCompatibilityTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(token.status_code, 200)
                 self.assertEqual(
                     token.json(),
-                    {"access_token": "sk_valid", "token_type": "Bearer"},
+                    {"access_token": "sk_valid", "token_type": "Bearer", "scope": "mcp"},
                 )
 
     async def test_pkce_failure_does_not_redeem_authorization_code(self):
@@ -433,8 +436,17 @@ class OAuthCompatibilityTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("resource_metadata=", response.headers["www-authenticate"])
 
         discovery = await self.client.post("/", headers={"Accept": "text/html"})
-        self.assertNotEqual(discovery.status_code, 401)
-        self.assertNotIn("www-authenticate", discovery.headers)
+        self.assertEqual(discovery.status_code, 401)
+        self.assertIn("resource_metadata=", discovery.headers["www-authenticate"])
+
+    async def test_json_rpc_discovery_reaches_mcp_without_bearer_token(self):
+        response = await self.client.post(
+            "/",
+            json={"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), {"authorization": None})
 
     async def test_browser_get_with_invalid_authorization_receives_bearer_challenge(self):
         for authorization in ("Basic dXNlcjpwYXNz", "Bearer"):
@@ -463,11 +475,97 @@ class OAuthCompatibilityTests(unittest.IsolatedAsyncioTestCase):
         authorization = await self.client.get("/.well-known/oauth-authorization-server")
         self.assertEqual(authorization.json()["code_challenge_methods_supported"], ["S256"])
         self.assertEqual(authorization.json()["token_endpoint"], "https://mcp.example/token")
-        self.assertNotIn("registration_endpoint", authorization.json())
+        self.assertEqual(authorization.json()["registration_endpoint"], "https://mcp.example/register")
 
         resource = await self.client.get("/.well-known/oauth-protected-resource")
         self.assertEqual(resource.json()["resource"], RESOURCE)
         self.assertEqual(resource.json()["authorization_servers"], ["https://mcp.example"])
+
+        openid_configuration = await self.client.get("/.well-known/openid-configuration")
+        self.assertEqual(openid_configuration.status_code, 404)
+        self.assertEqual(openid_configuration.json()["error"], "not_supported")
+
+    async def test_dynamic_client_registration_supports_custom_connector_callback(self):
+        registration = await self.client.post(
+            "/register",
+            json={
+                "client_name": "ChatGPT Business",
+                "redirect_uris": ["https://chatgpt.com/connector/oauth/business-callback"],
+            },
+        )
+        self.assertEqual(registration.status_code, 201)
+        registered = registration.json()
+        self.assertTrue(registered["client_id"].startswith("mcp_"))
+        self.assertEqual(
+            registered["redirect_uris"],
+            ["https://chatgpt.com/connector/oauth/business-callback"],
+        )
+
+        params = self.authorization_params(
+            client_id=registered["client_id"],
+            redirect_uri=registered["redirect_uris"][0],
+        )
+        authorized = await self.client.post(
+            "/authorize",
+            data={**params, "api_key": "sk_valid"},
+        )
+        self.assertEqual(authorized.status_code, 302)
+        code = parse_qs(urlsplit(authorized.headers["location"]).query)["code"][0]
+
+        token = await self.client.post(
+            "/token",
+            data={
+                "grant_type": "authorization_code",
+                "client_id": registered["client_id"],
+                "redirect_uri": params["redirect_uri"],
+                "code": code,
+                "code_verifier": VERIFIER,
+                "resource": RESOURCE,
+            },
+        )
+        self.assertEqual(token.status_code, 200)
+        self.assertEqual(
+            token.json(),
+            {"access_token": "sk_valid", "token_type": "Bearer", "scope": "mcp"},
+        )
+
+    async def test_dynamic_registration_preserves_supported_refresh_grant(self):
+        registration = await self.client.post(
+            "/register",
+            json={
+                "client_name": "ChatGPT",
+                "redirect_uris": ["https://chatgpt.com/connector/oauth/test-callback"],
+                "grant_types": ["authorization_code", "refresh_token"],
+                "response_types": ["code"],
+                "token_endpoint_auth_method": "none",
+            },
+        )
+
+        self.assertEqual(registration.status_code, 201)
+        self.assertEqual(
+            registration.json()["grant_types"],
+            ["authorization_code", "refresh_token"],
+        )
+        metadata = await self.client.get("/.well-known/oauth-authorization-server")
+        self.assertEqual(
+            metadata.json()["grant_types_supported"],
+            ["authorization_code", "refresh_token"],
+        )
+        self.assertEqual(metadata.json()["scopes_supported"], ["mcp", "offline_access"])
+
+    async def test_dynamic_registration_rejects_insecure_or_query_callback(self):
+        for redirect_uri in (
+            "https://evil.example/callback?next=evil",
+            "http://evil.example/callback",
+            "https://chatgpt.com/connector/oauth/callback#fragment",
+        ):
+            with self.subTest(redirect_uri=redirect_uri):
+                response = await self.client.post(
+                    "/register",
+                    json={"redirect_uris": [redirect_uri]},
+                )
+                self.assertEqual(response.status_code, 400)
+                self.assertEqual(response.json()["error"], "invalid_redirect_uri")
 
     async def test_default_key_validator_only_accepts_authenticated_validation_response(self):
         class FakeClient:
